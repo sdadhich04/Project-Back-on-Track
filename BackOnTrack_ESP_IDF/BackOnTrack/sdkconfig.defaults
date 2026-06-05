@@ -1,0 +1,48 @@
+# sdkconfig.defaults for BackOnTrack — Dual-IMU + BLE version
+# ESP32-S3 target, ESP-IDF v5.x
+
+# ==================== Target ====================
+CONFIG_IDF_TARGET="esp32s3"
+
+# ==================== FreeRTOS ====================
+CONFIG_FREERTOS_HZ=1000
+CONFIG_FREERTOS_GENERATE_RUN_TIME_STATS=n
+
+# ==================== SPI ====================
+CONFIG_SPI_MASTER_IN_IRAM=y
+
+# ==================== ADC ====================
+CONFIG_ADC_ONESHOT_CTRL_FUNC_IN_IRAM=y
+
+# ==================== Logging ====================
+CONFIG_LOG_DEFAULT_LEVEL_INFO=y
+
+# ==================== Compiler ====================
+CONFIG_COMPILER_OPTIMIZATION_SIZE=y
+
+# ==================== BLE (NimBLE) ====================
+# NimBLE is the recommended BLE stack for ESP-IDF v5.x.
+# Apache Bluedroid is the alternative but uses more RAM.
+CONFIG_BT_ENABLED=y
+CONFIG_BT_NIMBLE_ENABLED=y
+CONFIG_BT_CONTROLLER_ENABLED=y
+
+# Peripheral role only — we are the sensor, not the scanner
+CONFIG_BT_NIMBLE_ROLE_PERIPHERAL=y
+CONFIG_BT_NIMBLE_ROLE_CENTRAL=n
+CONFIG_BT_NIMBLE_ROLE_BROADCASTER=n
+CONFIG_BT_NIMBLE_ROLE_OBSERVER=n
+
+# One connection maximum (single client)
+CONFIG_BT_NIMBLE_MAX_CONNECTIONS=1
+
+# MTU: 65 bytes covers our 60-byte bot_ble_packet_t with ATT overhead
+# Default is 23; set higher for larger packets.
+CONFIG_BT_NIMBLE_ATT_PREFERRED_MTU=65
+
+# NimBLE host task stack — 4KB is the minimum; 8KB recommended
+CONFIG_BT_NIMBLE_HOST_TASK_STACK_SIZE=8192
+
+# Security: none for prototype (no pairing, no bonding)
+# Enable CONFIG_BT_NIMBLE_SM_SC and CONFIG_BT_NIMBLE_SM_LEGACY for pairing
+CONFIG_BT_NIMBLE_SM_SC=n

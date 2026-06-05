@@ -1,0 +1,23 @@
+﻿# ESP-IDF build output
+build/
+**/build/
+
+# VS Code settings
+.vscode/
+
+# Python cache
+__pycache__/
+*.pyc
+
+# Archives
+*.zip
+
+# Logs
+*.log
+
+# Temporary files
+*.tmp
+
+# OS files
+.DS_Store
+Thumbs.db

@@ -1,0 +1,14 @@
+idf_component_register(
+    SRCS
+        "posture_features.c"
+        "posture_classifier.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        data_types
+        sensor_hal
+        drivers
+        freertos
+        log
+        esp_timer
+)

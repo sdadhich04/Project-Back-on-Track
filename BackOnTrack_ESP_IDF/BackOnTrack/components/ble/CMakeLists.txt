@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS
+        "ble_telemetry.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        data_types
+        bt
+        freertos
+        log
+        esp_timer
+)

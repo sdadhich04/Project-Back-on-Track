@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS
+        "telemetry_serial.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        data_types
+        posture
+        freertos
+        log
+        esp_timer
+)

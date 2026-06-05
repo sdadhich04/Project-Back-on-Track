@@ -1,0 +1,14 @@
+idf_component_register(
+    SRCS
+        "driver_bno085.c"
+        "driver_myoware.c"
+    INCLUDE_DIRS
+        "include"
+    REQUIRES
+        sensor_hal
+        data_types
+        driver
+        freertos
+        log
+        esp_adc
+)
