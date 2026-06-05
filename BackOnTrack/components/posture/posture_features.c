@@ -103,35 +103,81 @@ bool posture_calibrate(SensorContext_t *imu_upper_ctx,
     ESP_LOGI(TAG, "Sit in NEUTRAL upright posture. Relax muscles.");
     ESP_LOGI(TAG, "Sampling for %"PRIu32" ms...", duration_ms);
 
+    // --- Prime the IMUs ---
+    // The BNO085 needs several read cycles after init before it starts
+    // delivering valid Game Rotation Vector packets. The last_sample cache
+    // starts with valid=false, so we must drain non-report packets first.
+    // Poll both IMUs until we get at least one valid sample from each,
+    // or give up after 3 seconds (shouldn't happen after a successful init).
+    ESP_LOGI(TAG, "Priming IMUs...");
+    imu_sample_t imu_up = {}, imu_lo = {};
+    bool upper_primed = false, lower_primed = false;
+    uint32_t prime_start = get_timestamp_ms();
+
+    while ((!upper_primed || !lower_primed)
+           && (get_timestamp_ms() - prime_start < 3000)) {
+        if (!upper_primed) {
+            bno085_read_orientation(imu_upper_ctx, &imu_up);
+            if (imu_up.valid) {
+                upper_primed = true;
+                ESP_LOGI(TAG, "IMU0 primed (pitch=%.2f)", imu_up.pitch_deg);
+            }
+        }
+        if (!lower_primed) {
+            bno085_read_orientation(imu_lower_ctx, &imu_lo);
+            if (imu_lo.valid) {
+                lower_primed = true;
+                ESP_LOGI(TAG, "IMU1 primed (pitch=%.2f)", imu_lo.pitch_deg);
+            }
+        }
+        vTaskDelay(pdMS_TO_TICKS(25));  // 25ms > 20ms BNO085 report interval at 50Hz
+    }
+
+    if (!upper_primed) ESP_LOGW(TAG, "IMU0 did not prime — calibration may fail");
+    if (!lower_primed) ESP_LOGW(TAG, "IMU1 did not prime — calibration may fail");
+
+    // --- Sampling loop ---
     double sum_up_pitch = 0, sum_up_roll = 0, sum_up_yaw = 0;
     double sum_lo_pitch = 0, sum_lo_roll = 0, sum_lo_yaw = 0;
     double sum_emg = 0;
     int    up_count = 0, lo_count = 0, emg_count = 0;
 
     uint32_t start_ms = get_timestamp_ms();
-    imu_sample_t imu_up, imu_lo;
     emg_sample_t emg_s;
 
     while (get_timestamp_ms() - start_ms < duration_ms) {
-        if (bno085_read_orientation(imu_upper_ctx, &imu_up) && imu_up.valid) {
+        // Read IMU upper — use 25ms delay so we always wait for a fresh packet
+        bno085_read_orientation(imu_upper_ctx, &imu_up);
+        if (imu_up.valid) {
             sum_up_pitch += imu_up.pitch_deg;
             sum_up_roll  += imu_up.roll_deg;
             sum_up_yaw   += imu_up.yaw_deg;
             up_count++;
         }
-        if (bno085_read_orientation(imu_lower_ctx, &imu_lo) && imu_lo.valid) {
+
+        // Read IMU lower
+        bno085_read_orientation(imu_lower_ctx, &imu_lo);
+        if (imu_lo.valid) {
             sum_lo_pitch += imu_lo.pitch_deg;
             sum_lo_roll  += imu_lo.roll_deg;
             sum_lo_yaw   += imu_lo.yaw_deg;
             lo_count++;
         }
+
+        // Read EMG
         if (myoware_read_sample(emg_ctx, &emg_s) && emg_s.valid) {
             myoware_update_baseline(&emg_s);
             sum_emg += emg_s.raw_adc;
             emg_count++;
         }
-        vTaskDelay(pdMS_TO_TICKS(10));
+
+        // 25ms gives ~40 Hz sampling — well above what we need for calibration
+        // and guarantees each BNO085 call sees a fresh packet (50Hz = 20ms period)
+        vTaskDelay(pdMS_TO_TICKS(25));
     }
+
+    ESP_LOGI(TAG, "Samples collected: upper=%d lower=%d emg=%d",
+             up_count, lo_count, emg_count);
 
     if (up_count == 0 || lo_count == 0 || emg_count == 0) {
         ESP_LOGE(TAG, "Calibration FAILED (upper=%d lower=%d emg=%d samples)",
