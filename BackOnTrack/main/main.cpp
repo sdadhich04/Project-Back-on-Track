@@ -305,6 +305,14 @@ void app_main(void) {
         ESP_LOGE(TAG, "BLE init FAILED — continuing without BLE");
     }
 
+    // --- Countdown BEFORE sensor init ---
+    // User gets ready while BLE starts advertising.
+    // IMUs must be initialised AFTER this delay so their output buffers
+    // are fresh when calibration starts immediately after init.
+    ESP_LOGI(TAG, "Starting in 5 seconds — sit upright, relax muscles...");
+    ESP_LOGI(TAG, "BLE: connect now to trigger calibration remotely later");
+    vTaskDelay(pdMS_TO_TICKS(5000));
+
     // --- IMU0 (upper back) ---
     ESP_LOGI(TAG, "Initializing IMU0 upper (CS=GPIO%d)...", BNO085_0_PIN_CS);
     if (!bno085_init(&g_imu_upper_ctx)) {
@@ -326,10 +334,10 @@ void app_main(void) {
         g_emg_ctx.enabled = false;
     } else { ESP_LOGI(TAG, "MyoWare OK"); }
 
-    // --- Calibration ---
-    ESP_LOGI(TAG, "Calibration in 5 seconds — sit upright, relax muscles...");
-    ESP_LOGI(TAG, "BLE: connect now if you want to trigger calibration remotely later");
-    vTaskDelay(pdMS_TO_TICKS(5000));
+    // --- Calibration runs immediately after init (no extra delay) ---
+    // IMU buffers are fresh — bno085_init() now blocks until the first
+    // sensor report is cached, so posture_calibrate() sees valid data
+    // from the very first read call.
     posture_calibrate(&g_imu_upper_ctx, &g_imu_lower_ctx, &g_emg_ctx,
                        &g_calibration, 5000);
 

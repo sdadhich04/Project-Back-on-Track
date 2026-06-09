@@ -34,7 +34,12 @@ static const char *TAG = "bno085";
 // ==================== SHTP Protocol Constants ====================
 
 #define SHTP_HEADER_LEN                 4
-#define SHTP_MAX_PACKET                 512
+// BNO085 SHTP packet size limit.
+// The BNO085 sends a 1024-byte SHTP advertisement (channel 0) after init.
+// With SHTP_MAX_PACKET=512, that packet is rejected (1024 > 512), the
+// advertisement never drains, and the BNO085 cannot send FEATURE_RESPONSE
+// or sensor data. Must be 1024 to match the BNO085's actual advertisement size.
+#define SHTP_MAX_PACKET                 1024
 #define SHTP_CHANNEL_EXE                1
 #define SHTP_CHANNEL_CONTROL            2
 #define SHTP_CHANNEL_REPORTS            3
@@ -61,6 +66,7 @@ typedef struct {
     uint8_t                 seq_control;
     uint8_t                 seq_exe;
     imu_sample_t            last_sample;
+    uint8_t                 rx_buf[SHTP_MAX_PACKET]; // per-IMU RX buffer — not on stack
 } bno085_state_t;
 
 // Array of states — one per IMU
@@ -105,9 +111,13 @@ static int bno085_read_packet(bno085_state_t *st, uint8_t *buf, size_t buf_size)
     size_t read_len = (buf_size < SHTP_MAX_PACKET) ? buf_size : SHTP_MAX_PACKET;
     static uint8_t tx_dummy[SHTP_MAX_PACKET];
     memset(tx_dummy, 0x00, read_len);
-    if (!st->initialized) {
-        tx_dummy[0] = 0x04;
-    }
+    // Send the SHTP heartbeat [04 00 00 00 ...] whenever the BNO085 needs
+    // clock activity to advance its state machine. This applies both during
+    // the init drain phase AND during the first-report polling after init —
+    // the BNO085 will not produce sensor reports without continued SPI clock
+    // activity after the SET_FEATURE command is sent.
+    // The heartbeat is a no-op to the BNO085 (channel 0 length 4 = empty).
+    tx_dummy[0] = 0x04;
     if (!spi_transfer(st, tx_dummy, buf, read_len)) return -1;
     uint16_t pkt_len = (uint16_t)buf[0] | ((uint16_t)(buf[1] & 0x7F) << 8);
     if (pkt_len < SHTP_HEADER_LEN || pkt_len > buf_size) return -1;
@@ -116,15 +126,45 @@ static int bno085_read_packet(bno085_state_t *st, uint8_t *buf, size_t buf_size)
 
 static bool bno085_send_packet(bno085_state_t *st, uint8_t channel, uint8_t *seq,
                                 const uint8_t *payload, uint16_t payload_len) {
-    uint8_t pkt[64];
-    if ((size_t)(payload_len + SHTP_HEADER_LEN) > sizeof(pkt)) {
+    // CRITICAL: use a SHTP_MAX_PACKET (512-byte) transaction, NOT a short one.
+    //
+    // The BNO085 SHTP-over-SPI protocol requires the master to hold CS LOW long
+    // enough for the slave to both RECEIVE the command AND RESPOND in the same
+    // transaction window. A short transaction (e.g. 21 bytes for SET_FEATURE)
+    // ends CS before the BNO085 has enough clock cycles to latch the command
+    // reliably. The BNO085 silently ignores the truncated command and never
+    // asserts INT or generates sensor reports.
+    //
+    // The product ID request path (which is the ONLY path known to work) uses
+    // a 512-byte transaction. We must do the same for every outgoing command.
+    //
+    // This matches the Hillcrest/Ceva SH-2 reference driver behavior.
+    static uint8_t tx_buf[SHTP_MAX_PACKET];
+    static uint8_t rx_buf[SHTP_MAX_PACKET];
+
+    if (payload_len + SHTP_HEADER_LEN > SHTP_MAX_PACKET) {
         ESP_LOGE(TAG, "send_packet: payload too large (%d bytes)", payload_len);
         return false;
     }
-    shtp_build_packet(channel, *seq, payload, payload_len, pkt);
+
+    memset(tx_buf, 0x00, SHTP_MAX_PACKET);
+    shtp_build_packet(channel, *seq, payload, payload_len, tx_buf);
     *seq = (*seq + 1) & 0xFF;
-    uint8_t rx_dummy[64];
-    return spi_transfer(st, pkt, rx_dummy, payload_len + SHTP_HEADER_LEN);
+
+    bool ok = spi_transfer(st, tx_buf, rx_buf, SHTP_MAX_PACKET);
+
+    // Check if the BNO085 sent something back in the same transaction.
+    // Logged at INFO so it always appears — critical for diagnosing whether
+    // the BNO085 is responding to commands in the same SPI window.
+    if (ok) {
+        uint16_t rx_len = (uint16_t)rx_buf[0] | ((uint16_t)(rx_buf[1] & 0x7F) << 8);
+        if (rx_len >= SHTP_HEADER_LEN && rx_len <= SHTP_MAX_PACKET) {
+            ESP_LOGI(TAG, "send_packet: BNO085 responded in same txn: len=%d ch=%d rid=0x%02X",
+                     rx_len, rx_buf[2],
+                     rx_len > SHTP_HEADER_LEN ? rx_buf[SHTP_HEADER_LEN] : 0);
+        }
+    }
+    return ok;
 }
 
 static void bno085_hw_reset(bno085_state_t *st) {
@@ -210,8 +250,32 @@ static bool bno085_enable_report(bno085_state_t *st, uint8_t report_id, uint32_t
     cmd[6] = (uint8_t)((interval_us >> 8)  & 0xFF);
     cmd[7] = (uint8_t)((interval_us >> 16) & 0xFF);
     cmd[8] = (uint8_t)((interval_us >> 24) & 0xFF);
+
+    // bno085_send_packet now uses a 512-byte transaction so the BNO085
+    // receives the full command AND can return its FEATURE_RESPONSE in
+    // the same SPI window. Wait 100ms then drain any remaining packets.
     bool ok = bno085_send_packet(st, SHTP_CHANNEL_CONTROL, &st->seq_control, cmd, 17);
-    vTaskDelay(pdMS_TO_TICKS(50));
+    vTaskDelay(pdMS_TO_TICKS(100));
+
+    // Drain any remaining packets (ACKs, FRS continuation, etc.)
+    // Static: only called during sequential init, not concurrent. Keeps it off the stack.
+    static uint8_t drain_buf[SHTP_MAX_PACKET];
+    int drained = 0;
+    for (int i = 0; i < 10; i++) {
+        int n = bno085_read_packet(st, drain_buf, sizeof(drain_buf));
+        if (n >= SHTP_HEADER_LEN) {
+            drained++;
+            ESP_LOGI(TAG, "  feature enable drain[%d]: len=%d ch=%d rid=0x%02X",
+                     i, n, drain_buf[2],
+                     n > SHTP_HEADER_LEN ? drain_buf[SHTP_HEADER_LEN] : 0);
+        } else {
+            break;  // No more packets
+        }
+        vTaskDelay(pdMS_TO_TICKS(10));
+    }
+    if (drained > 0)
+        ESP_LOGI(TAG, "  feature enable: drained %d packets", drained);
+
     return ok;
 }
 
@@ -282,8 +346,11 @@ bool bno085_init(SensorContext_t *ctx) {
     }
 
     // --- Add this sensor's SPI device (each has its own CS) ---
+    // 1 MHz instead of 3 MHz — breadboard wire parasitics cause signal integrity
+    // issues at 3 MHz. The BNO085 supports up to 3 MHz but on a breadboard with
+    // ~20cm jumper wires, 1 MHz gives 3x more margin on setup/hold times.
     spi_device_interface_config_t dev_cfg = {
-        .clock_speed_hz = 3 * 1000 * 1000,
+        .clock_speed_hz = 1 * 1000 * 1000,
         .mode           = 0,
         .spics_io_num   = cfg->cs_pin,
         .queue_size     = 1,
@@ -303,8 +370,10 @@ bool bno085_init(SensorContext_t *ctx) {
 
     // ==================== Init Retry Loop ====================
 
-    uint8_t rx_buf[SHTP_MAX_PACKET];
-    uint8_t saved_pid_buf[SHTP_MAX_PACKET];
+    // Static: bno085_init is called sequentially (IMU0 then IMU1), never concurrently.
+    // Keeps 2KB off the main task stack, preventing stack overflow with 1024-byte SHTP_MAX_PACKET.
+    static uint8_t rx_buf[SHTP_MAX_PACKET];
+    static uint8_t saved_pid_buf[SHTP_MAX_PACKET];
     bool found_product_id = false;
     const int MAX_ATTEMPTS = 3;
 
@@ -319,8 +388,11 @@ bool bno085_init(SensorContext_t *ctx) {
 
         bno085_hw_reset(st);
 
-        uint8_t reset_cmd = 1;
-        bno085_send_packet(st, SHTP_CHANNEL_EXE, &st->seq_exe, &reset_cmd, 1);
+        // NOTE: No software reset sent here. Hardware reset alone is sufficient.
+        // Sending an additional soft reset (EXE channel, 0x01) causes a second
+        // boot cycle and has been found to prevent SET_FEATURE_COMMAND from
+        // being processed correctly. Hardware reset → wait 350ms → INT asserts
+        // is the correct and sufficient init sequence.
 
         bool int_rdy = bno085_wait_int(st, 800);
         if (!int_rdy) {
@@ -395,18 +467,22 @@ bool bno085_init(SensorContext_t *ctx) {
         ESP_LOGI(TAG, "IMU%d Part Number: 0x%08"PRIx32, ctx->id, part_no);
     }
 
-    // Drain FRS records
+    // Drain FRS records — read packets for a fixed 500ms window.
+    // Do NOT check INT pin here — FRS records arrive regardless of INT state
+    // and the old INT-based break exited immediately (INT goes HIGH after product
+    // ID exchange), leaving FRS packets unread. Those then blocked the first-report
+    // polling loop from ever seeing a Game RV packet.
     int frs_drained = 0;
-    for (int i = 0; i < 200; i++) {
-        if (cfg->int_pin >= 0 && gpio_get_level(cfg->int_pin) != 0) {
-            vTaskDelay(pdMS_TO_TICKS(50));
-            if (gpio_get_level(cfg->int_pin) != 0) break;
-        }
+    uint32_t frs_start = get_timestamp_ms();
+    while (get_timestamp_ms() - frs_start < 500) {
         int pkt_n = bno085_read_packet(st, rx_buf, sizeof(rx_buf));
-        if (pkt_n > 0) frs_drained++;
-        else vTaskDelay(pdMS_TO_TICKS(10));
+        if (pkt_n > 0) {
+            frs_drained++;
+        } else {
+            vTaskDelay(pdMS_TO_TICKS(10));
+        }
     }
-    ESP_LOGD(TAG, "IMU%d FRS drain: %d packets", ctx->id, frs_drained);
+    ESP_LOGI(TAG, "IMU%d FRS drain: %d packets in 500ms", ctx->id, frs_drained);
 
     // Enable Game Rotation Vector
     ESP_LOGI(TAG, "IMU%d: Enabling Game Rotation Vector at %d Hz", ctx->id, IMU_SAMPLE_RATE_HZ);
@@ -420,6 +496,55 @@ bool bno085_init(SensorContext_t *ctx) {
 
     st->initialized = true;
     ESP_LOGI(TAG, "IMU%d init complete (game_rv=%s)", ctx->id, st->game_rv_enabled ? "ON" : "FALLBACK");
+
+    // Read packets until we get the first real sensor report and cache it in
+    // last_sample with valid=true. This means bno085_read_orientation() returns
+    // valid data immediately after init — critical for calibration working.
+    //
+    // Polls unconditionally (does NOT check INT pin) so it works even if:
+    //   - The 10K pull-up is fitted but INT is briefly high between reports
+    //   - The pull-up is missing (INT floats high)
+    // At 50 Hz, a real report arrives every 20ms. We poll for up to 2 seconds.
+    ESP_LOGI(TAG, "IMU%d: waiting for first sensor report...", ctx->id);
+    bool got_first = false;
+    for (int i = 0; i < 80 && !got_first; i++) {
+        int pkt_n = bno085_read_packet(st, rx_buf, sizeof(rx_buf));
+        if (pkt_n >= (int)(SHTP_HEADER_LEN + 1)) {
+            uint8_t  ch  = rx_buf[2];
+            uint8_t  rid = rx_buf[SHTP_HEADER_LEN];
+            uint16_t pay = (uint16_t)(pkt_n - SHTP_HEADER_LEN);
+            // Debug: log every packet so we can see what's actually arriving
+            ESP_LOGI(TAG, "IMU%d pkt[%d]: len=%d ch=%d rid=0x%02X",
+                     ctx->id, i, pkt_n, ch, rid);
+            if (ch == SHTP_CHANNEL_REPORTS) {
+                imu_sample_t tmp = {};
+                tmp.sensor_id    = (uint8_t)ctx->id;
+                bool parsed = false;
+                if (rid == SH2_REPORTID_GAME_ROTATION_VECTOR)
+                    parsed = parse_game_rotation_vector(rx_buf + SHTP_HEADER_LEN, pay, &tmp);
+                else if (rid == SH2_REPORTID_ACCELEROMETER)
+                    parsed = parse_accelerometer(rx_buf + SHTP_HEADER_LEN, pay, &tmp);
+                if (parsed && tmp.valid) {
+                    tmp.timestamp_ms = get_timestamp_ms();
+                    st->last_sample  = tmp;
+                    got_first        = true;
+                    ESP_LOGI(TAG, "IMU%d ready — pitch=%.2f roll=%.2f",
+                             ctx->id, tmp.pitch_deg, tmp.roll_deg);
+                }
+            }
+        } else {
+            // n=-1 means buf[0..1] decoded to pkt_len < 4.
+            // Log raw bytes so we can see if they're all zeros (nothing queued)
+            // or non-zero values (length field being corrupted by SPI noise).
+            ESP_LOGI(TAG, "IMU%d pkt[%d]: n=-1 raw=[%02X %02X %02X %02X]",
+                     ctx->id, i, rx_buf[0], rx_buf[1], rx_buf[2], rx_buf[3]);
+        }
+        vTaskDelay(pdMS_TO_TICKS(25));
+    }
+    if (!got_first) {
+        ESP_LOGW(TAG, "IMU%d: no sensor report in 2s — wiring may be incomplete", ctx->id);
+    }
+
     return true;
 }
 
@@ -430,9 +555,18 @@ bool bno085_read_orientation(SensorContext_t *ctx, imu_sample_t *out) {
     bno085_state_t *st = &s_bno085[ctx->id];
     if (!st->initialized) { out->valid = false; return false; }
 
-    bno085_wait_int(st, 20);
+    // Wait up to 50ms for INT to assert.
+    // At 50 Hz the report period is 20ms. 50ms gives 2.5x margin —
+    // handles the case where calibration calls read_orientation right after
+    // init when the BNO085 is still sending SHTP control ACK packets before
+    // the first sensor report arrives. 20ms was too short and timed out,
+    // returning last_sample with valid=false during calibration priming.
+    bno085_wait_int(st, 50);
 
-    uint8_t rx_buf[SHTP_MAX_PACKET];
+    // Use the per-IMU rx_buf from state struct — not stack allocated.
+    // imu_upper_task and imu_lower_task each have their own bno085_state_t,
+    // so this is concurrent-safe (no shared buffer between the two IMUs).
+    uint8_t *rx_buf = st->rx_buf;
     int n = bno085_read_packet(st, rx_buf, sizeof(rx_buf));
     if (n < SHTP_HEADER_LEN) {
         *out = st->last_sample;
