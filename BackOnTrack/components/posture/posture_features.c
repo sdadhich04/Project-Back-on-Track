@@ -23,6 +23,63 @@
 
 static const char *TAG = "posture_feat";
 
+#ifndef M_PI
+#define M_PI 3.14159265358979323846
+#endif
+#define RAD2DEG (180.0f / (float)M_PI)
+
+static inline float clampf(float v, float lo, float hi) {
+    return v < lo ? lo : (v > hi ? hi : v);
+}
+
+// Gravity (down) direction in the sensor body frame, from the Game Rotation
+// Vector quaternion. Returns a unit vector. The absolute sign convention is
+// irrelevant: every posture metric is a DIFFERENCE between the live vector and
+// the neutral vector captured at calibration, so only consistency matters.
+static void gravity_from_quat(const imu_sample_t *s, float *gx, float *gy, float *gz) {
+    float qi = s->q_i, qj = s->q_j, qk = s->q_k, qr = s->q_r;
+    float x = 2.0f * (qi * qk - qr * qj);
+    float y = 2.0f * (qj * qk + qr * qi);
+    float z = qr * qr - qi * qi - qj * qj + qk * qk;
+    float n = sqrtf(x * x + y * y + z * z);
+    if (n < 1e-6f) n = 1.0f;
+    *gx = x / n; *gy = y / n; *gz = z / n;
+}
+
+// Decompose live gravity g against neutral gravity g0 into signed forward
+// (pitch) and lateral (roll) lean plus total lean, all in degrees. Builds an
+// orthonormal basis {fwd, right, up=g0} from g0 and a deterministic reference
+// axis, so the split is stable run-to-run. Singularity-free until the body is
+// tilted ~90° from neutral (du -> 0) — far beyond any sitting posture.
+static void lean_from_gravity(float gx, float gy, float gz,
+                              float g0x, float g0y, float g0z,
+                              float *fwd_dev, float *lat_dev, float *lean) {
+    // reference axis least aligned with up (g0) to avoid a degenerate cross
+    float rx = 0.0f, ry = 0.0f, rz = 1.0f;
+    if (fabsf(g0z) >= 0.9f) { rx = 1.0f; ry = 0.0f; rz = 0.0f; }
+
+    // right = up x ref (normalized)
+    float right_x = g0y * rz - g0z * ry;
+    float right_y = g0z * rx - g0x * rz;
+    float right_z = g0x * ry - g0y * rx;
+    float rn = sqrtf(right_x*right_x + right_y*right_y + right_z*right_z);
+    if (rn < 1e-6f) rn = 1.0f;
+    right_x /= rn; right_y /= rn; right_z /= rn;
+
+    // fwd = right x up (already unit: right and up are orthonormal)
+    float fwd_x = right_y * g0z - right_z * g0y;
+    float fwd_y = right_z * g0x - right_x * g0z;
+    float fwd_z = right_x * g0y - right_y * g0x;
+
+    float du = gx*g0x + gy*g0y + gz*g0z;          // ~cos(total lean)
+    float dr = gx*right_x + gy*right_y + gz*right_z;
+    float df = gx*fwd_x   + gy*fwd_y   + gz*fwd_z;
+
+    *fwd_dev = atan2f(df, du) * RAD2DEG * POSTURE_FORWARD_SIGN;
+    *lat_dev = atan2f(dr, du) * RAD2DEG * POSTURE_LATERAL_SIGN;
+    *lean    = acosf(clampf(du, -1.0f, 1.0f)) * RAD2DEG;
+}
+
 bool posture_features_compute(const imu_sample_t  *imu_upper,
                                const imu_sample_t  *imu_lower,
                                const emg_sample_t  *emg,
@@ -40,13 +97,26 @@ bool posture_features_compute(const imu_sample_t  *imu_upper,
     out->upper_yaw_raw    = imu_upper->yaw_deg;
 
     if (imu_upper->valid && cal->calibrated) {
-        out->upper_pitch_deviation = imu_upper->pitch_deg - cal->neutral_upper_pitch_deg;
-        out->upper_roll_deviation  = imu_upper->roll_deg  - cal->neutral_upper_roll_deg;
-        out->upper_yaw_deviation   = imu_upper->yaw_deg   - cal->neutral_upper_yaw_deg;
+        // Gravity-vector tilt relative to the calibrated neutral gravity vector.
+        // Singularity-free across the posture range and insensitive to twisting
+        // in the chair (yaw about vertical), unlike subtracting Euler angles.
+        float gx, gy, gz;
+        gravity_from_quat(imu_upper, &gx, &gy, &gz);
+        float fwd, lat, lean;
+        lean_from_gravity(gx, gy, gz,
+                          cal->neutral_upper_gx,
+                          cal->neutral_upper_gy,
+                          cal->neutral_upper_gz,
+                          &fwd, &lat, &lean);
+        out->upper_pitch_deviation = fwd;   // + = forward / slouch
+        out->upper_roll_deviation  = lat;   // + = right, - = left
+        out->upper_lean_deg        = lean;  // total unsigned tilt from neutral
+        out->upper_yaw_deviation   = imu_upper->yaw_deg - cal->neutral_upper_yaw_deg;
     } else if (imu_upper->valid) {
         out->upper_pitch_deviation = imu_upper->pitch_deg;
         out->upper_roll_deviation  = imu_upper->roll_deg;
         out->upper_yaw_deviation   = imu_upper->yaw_deg;
+        out->upper_lean_deg        = 0.0f;
         ESP_LOGW(TAG, "No calibration — using raw upper IMU angles");
     }
 
@@ -111,7 +181,7 @@ bool posture_calibrate(SensorContext_t *imu_upper_ctx,
     // or give up after 3 seconds (shouldn't happen after a successful init).
     ESP_LOGI(TAG, "Priming IMUs...");
     imu_sample_t imu_up = {}, imu_lo = {};
-    bool upper_primed = false, lower_primed = false;
+    bool upper_primed = false, lower_primed = !imu_lower_ctx->enabled;
     uint32_t prime_start = get_timestamp_ms();
 
     while ((!upper_primed || !lower_primed)
@@ -138,6 +208,7 @@ bool posture_calibrate(SensorContext_t *imu_upper_ctx,
 
     // --- Sampling loop ---
     double sum_up_pitch = 0, sum_up_roll = 0, sum_up_yaw = 0;
+    double sum_up_gx = 0, sum_up_gy = 0, sum_up_gz = 0;
     double sum_lo_pitch = 0, sum_lo_roll = 0, sum_lo_yaw = 0;
     double sum_emg = 0;
     int    up_count = 0, lo_count = 0, emg_count = 0;
@@ -152,16 +223,21 @@ bool posture_calibrate(SensorContext_t *imu_upper_ctx,
             sum_up_pitch += imu_up.pitch_deg;
             sum_up_roll  += imu_up.roll_deg;
             sum_up_yaw   += imu_up.yaw_deg;
+            float gx, gy, gz;
+            gravity_from_quat(&imu_up, &gx, &gy, &gz);
+            sum_up_gx += gx; sum_up_gy += gy; sum_up_gz += gz;
             up_count++;
         }
 
-        // Read IMU lower
-        bno085_read_orientation(imu_lower_ctx, &imu_lo);
-        if (imu_lo.valid) {
-            sum_lo_pitch += imu_lo.pitch_deg;
-            sum_lo_roll  += imu_lo.roll_deg;
-            sum_lo_yaw   += imu_lo.yaw_deg;
-            lo_count++;
+        // Read IMU lower (skipped when disabled — single-IMU design)
+        if (imu_lower_ctx->enabled) {
+            bno085_read_orientation(imu_lower_ctx, &imu_lo);
+            if (imu_lo.valid) {
+                sum_lo_pitch += imu_lo.pitch_deg;
+                sum_lo_roll  += imu_lo.roll_deg;
+                sum_lo_yaw   += imu_lo.yaw_deg;
+                lo_count++;
+            }
         }
 
         // Read EMG
@@ -179,7 +255,7 @@ bool posture_calibrate(SensorContext_t *imu_upper_ctx,
     ESP_LOGI(TAG, "Samples collected: upper=%d lower=%d emg=%d",
              up_count, lo_count, emg_count);
 
-    if (up_count == 0 || lo_count == 0 || emg_count == 0) {
+    if (up_count == 0 || (imu_lower_ctx->enabled && lo_count == 0) || emg_count == 0) {
         ESP_LOGE(TAG, "Calibration FAILED (upper=%d lower=%d emg=%d samples)",
                  up_count, lo_count, emg_count);
         cal->calibrated = false;
@@ -190,15 +266,37 @@ bool posture_calibrate(SensorContext_t *imu_upper_ctx,
     cal->neutral_upper_roll_deg  = (float)(sum_up_roll  / up_count);
     cal->neutral_upper_yaw_deg   = (float)(sum_up_yaw   / up_count);
 
-    cal->neutral_lower_pitch_deg = (float)(sum_lo_pitch / lo_count);
-    cal->neutral_lower_roll_deg  = (float)(sum_lo_roll  / lo_count);
-    cal->neutral_lower_yaw_deg   = (float)(sum_lo_yaw   / lo_count);
+    // Neutral gravity vector (normalized mean) — basis for all lean math.
+    {
+        float gx = (float)(sum_up_gx / up_count);
+        float gy = (float)(sum_up_gy / up_count);
+        float gz = (float)(sum_up_gz / up_count);
+        float n = sqrtf(gx*gx + gy*gy + gz*gz);
+        if (n < 1e-6f) n = 1.0f;
+        cal->neutral_upper_gx = gx / n;
+        cal->neutral_upper_gy = gy / n;
+        cal->neutral_upper_gz = gz / n;
+    }
 
-    // Neutral spinal flexion: how much the lower back naturally pitches
-    // differently from the upper back when sitting correctly.
-    // Subtracted from future spinal_flexion_deg readings.
-    cal->neutral_spinal_flexion_deg =
-        cal->neutral_lower_pitch_deg - cal->neutral_upper_pitch_deg;
+    if (lo_count > 0) {
+        cal->neutral_lower_pitch_deg = (float)(sum_lo_pitch / lo_count);
+        cal->neutral_lower_roll_deg  = (float)(sum_lo_roll  / lo_count);
+        cal->neutral_lower_yaw_deg   = (float)(sum_lo_yaw   / lo_count);
+
+        // Neutral spinal flexion: how much the lower back naturally pitches
+        // differently from the upper back when sitting correctly.
+        // Subtracted from future spinal_flexion_deg readings.
+        cal->neutral_spinal_flexion_deg =
+            cal->neutral_lower_pitch_deg - cal->neutral_upper_pitch_deg;
+    } else {
+        // Single-IMU design: no lower IMU. Zero the lower neutrals; spinal
+        // flexion is unavailable, so the classifier's lumbar-collapse rule
+        // (which requires both IMUs valid) simply never fires.
+        cal->neutral_lower_pitch_deg    = 0.0f;
+        cal->neutral_lower_roll_deg     = 0.0f;
+        cal->neutral_lower_yaw_deg      = 0.0f;
+        cal->neutral_spinal_flexion_deg = 0.0f;
+    }
 
     cal->emg_resting_baseline = (float)(sum_emg / emg_count);
     cal->calibrated           = true;
@@ -215,6 +313,8 @@ bool posture_calibrate(SensorContext_t *imu_upper_ctx,
     ESP_LOGI(TAG, "  Neutral spinal flexion: %.2f deg",
              cal->neutral_spinal_flexion_deg);
     ESP_LOGI(TAG, "  EMG baseline: %.1f counts", cal->emg_resting_baseline);
+    ESP_LOGI(TAG, "  Neutral gravity (upper): [% .3f % .3f % .3f]",
+             cal->neutral_upper_gx, cal->neutral_upper_gy, cal->neutral_upper_gz);
 
     return true;
 }

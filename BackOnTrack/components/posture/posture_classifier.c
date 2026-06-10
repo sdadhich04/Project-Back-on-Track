@@ -73,6 +73,12 @@ static posture_state_t apply_rules(const posture_features_t *f) {
         if (f->upper_roll_deviation >= POSTURE_ROLL_LEAN_RIGHT_DEG) {
             return POSTURE_LEANING_RIGHT;
         }
+        // Combined/diagonal lean: total tilt is large even though neither the
+        // forward nor the lateral axis alone crossed its threshold. Flag as a
+        // generic bad posture (reported as SLOUCHING).
+        if (f->upper_lean_deg >= POSTURE_LEAN_ANY_DEG) {
+            return POSTURE_SLOUCHING;
+        }
     }
 
     return POSTURE_GOOD;

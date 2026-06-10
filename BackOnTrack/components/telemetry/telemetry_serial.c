@@ -43,7 +43,7 @@ void telemetry_print(const posture_features_t      *features,
     // CSV mode
     if (!s_header_printed) {
         printf("timestamp_ms,state_id,"
-               "upper_pitch_dev,upper_roll_dev,"
+               "upper_pitch_dev,upper_roll_dev,upper_lean,"
                "lower_pitch_dev,lower_roll_dev,"
                "spinal_flexion,"
                "emg_raw,emg_filt,emg_activity,"
@@ -51,7 +51,7 @@ void telemetry_print(const posture_features_t      *features,
         s_header_printed = true;
     }
     printf("%"PRIu32",%d,"
-           "%.2f,%.2f,"
+           "%.2f,%.2f,%.2f,"
            "%.2f,%.2f,"
            "%.2f,"
            "%d,%.1f,%.1f,"
@@ -59,6 +59,7 @@ void telemetry_print(const posture_features_t      *features,
            features->timestamp_ms,
            (int)result->state,
            features->upper_pitch_deviation, features->upper_roll_deviation,
+           features->upper_lean_deg,
            features->lower_pitch_deviation, features->lower_roll_deviation,
            features->spinal_flexion_deg,
            features->emg_raw_adc, features->emg_filtered, features->emg_activity,

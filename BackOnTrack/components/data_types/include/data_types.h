@@ -134,6 +134,7 @@ typedef struct {
     float upper_pitch_deviation;  // forward lean of upper back vs calibrated neutral
     float upper_roll_deviation;   // lateral lean of upper back
     float upper_yaw_deviation;    // twist of upper back
+    float upper_lean_deg;         // TOTAL unsigned tilt from neutral (gravity-based)
     float upper_pitch_raw;
     float upper_roll_raw;
     float upper_yaw_raw;
@@ -186,17 +187,33 @@ typedef struct {
 } posture_classification_t;
 
 // ==================== Posture Classification Thresholds ====================
-
-#define POSTURE_PITCH_SLOUCH_DEG         15.0f
-#define POSTURE_PITCH_LEAN_FWD_DEG       30.0f
-#define POSTURE_ROLL_LEAN_LEFT_DEG      -10.0f
-#define POSTURE_ROLL_LEAN_RIGHT_DEG      10.0f
+//
+// These now operate on GRAVITY-VECTOR TILT deviations (degrees) computed in
+// posture_features.c, NOT raw Euler angles. The deviations are signed angles
+// of how far the upper-back sensor has tilted from its calibrated neutral:
+//   upper_pitch_deviation  > 0  => leaning/slouching forward
+//   upper_roll_deviation   > 0  => leaning right ; < 0 => leaning left
+// and upper_lean_deg is the total (unsigned) tilt from neutral.
+//
+// Tuning: sit upright, then slouch/lean while watching upper_pitch_dev /
+// upper_roll_dev in the serial CSV, and set thresholds just above the noise
+// you see at rest (typically < 2°) and below the angle you consider "bad".
+#define POSTURE_PITCH_SLOUCH_DEG         10.0f   // mild forward lean -> SLOUCHING
+#define POSTURE_PITCH_LEAN_FWD_DEG       25.0f   // severe forward lean -> LEANING_FORWARD
+#define POSTURE_ROLL_LEAN_LEFT_DEG      -12.0f   // lateral lean left
+#define POSTURE_ROLL_LEAN_RIGHT_DEG      12.0f   // lateral lean right
+#define POSTURE_LEAN_ANY_DEG             14.0f   // combined/diagonal lean not caught by a single axis
 #define POSTURE_EMG_HIGH_THRESHOLD       80.0f
 #define POSTURE_CONFIRM_WINDOW_MS        750
 
+// Sign convention: if leaning forward shows up NEGATIVE in upper_pitch_dev,
+// flip POSTURE_FORWARD_SIGN to -1.0f (likewise lateral). Lets you correct for
+// how the board happens to be mounted without rewiring or recalibrating.
+#define POSTURE_FORWARD_SIGN            (+1.0f)
+#define POSTURE_LATERAL_SIGN           (+1.0f)
+
 // Lumbar collapse: lower back pitches forward MORE than upper back by this margin.
-// e.g. if IMU1 pitch is 12° more forward than IMU0 after neutral correction,
-// the user is rounding their lower back even if shoulders look fine.
+// (Single-IMU build: spinal flexion is unavailable, so this rule never fires.)
 #define POSTURE_LUMBAR_COLLAPSE_DEG      12.0f
 
 // ==================== Calibration Baseline ====================
@@ -218,6 +235,13 @@ typedef struct {
 
     // Derived: spinal flexion at neutral (usually ~0 but stored anyway)
     float neutral_spinal_flexion_deg;
+
+    // Neutral gravity direction in the UPPER sensor's body frame (unit vector),
+    // captured at calibration. Posture lean is measured as the angle the live
+    // gravity vector has moved from this — singularity-free, twist-tolerant.
+    float neutral_upper_gx;
+    float neutral_upper_gy;
+    float neutral_upper_gz;
 
     // EMG
     float emg_resting_baseline;

@@ -123,7 +123,7 @@ static SensorContext_t g_imu_lower_ctx = {
     .id               = IMU_ID_LOWER,
     .type             = SENSOR_TYPE_IMU_ORIENTATION,
     .sampling_rate_hz = IMU_SAMPLE_RATE_HZ,
-    .enabled          = true,
+    .enabled          = false,  // ABANDONED: single-IMU design (upper back only)
     .hw_config        = &g_bno085_lower_cfg,
     .init             = bno085_init,
     .read_sample      = bno085_read_sample,
@@ -156,23 +156,6 @@ static void imu_upper_task(void *pvParameters) {
         if (bno085_read_orientation(&g_imu_upper_ctx, &msg.data)) {
             if (xQueueSend(g_imu_queue, &msg, 0) != pdTRUE) {
                 ESP_LOGW(TAG, "IMU0 queue full");
-            }
-        }
-    }
-}
-
-static void imu_lower_task(void *pvParameters) {
-    ESP_LOGI(TAG, "imu_lower_task started (IMU1, %d Hz)", IMU_SAMPLE_RATE_HZ);
-    const TickType_t period = pdMS_TO_TICKS(1000 / IMU_SAMPLE_RATE_HZ);
-    TickType_t last_wake    = xTaskGetTickCount();
-    imu_queue_msg_t msg     = { .type = QUEUE_MSG_DATA };
-
-    while (1) {
-        vTaskDelayUntil(&last_wake, period);
-        if (!g_imu_lower_ctx.enabled) continue;
-        if (bno085_read_orientation(&g_imu_lower_ctx, &msg.data)) {
-            if (xQueueSend(g_imu_queue, &msg, 0) != pdTRUE) {
-                ESP_LOGW(TAG, "IMU1 queue full");
             }
         }
     }
@@ -320,12 +303,14 @@ void app_main(void) {
         g_imu_upper_ctx.enabled = false;
     } else { ESP_LOGI(TAG, "IMU0 OK"); }
 
-    // --- IMU1 (lower back) — reuses SPI bus from IMU0 init ---
-    ESP_LOGI(TAG, "Initializing IMU1 lower (CS=GPIO%d)...", BNO085_1_PIN_CS);
-    if (!bno085_init(&g_imu_lower_ctx)) {
-        ESP_LOGE(TAG, "IMU1 FAILED — lower back data will be invalid");
-        g_imu_lower_ctx.enabled = false;
-    } else { ESP_LOGI(TAG, "IMU1 OK"); }
+    // --- IMU1 (lower back) — DISABLED (single-IMU design) ---
+    // The esp32_BNO08x library embeds the CEVA SH-2 stack, which is single-
+    // instance (one global sh2_t in sh2.c; shtp.c MAX_INSTANCES == 1). A second
+    // BNO08x cannot be opened in the same firmware — sh2_open() fails and its
+    // orphaned service task null-derefs. So we intentionally skip IMU1 entirely
+    // and run upper-back posture only.
+    ESP_LOGI(TAG, "IMU1 lower DISABLED — single-IMU design (upper back only)");
+    g_imu_lower_ctx.enabled = false;
 
     // --- MyoWare ---
     ESP_LOGI(TAG, "Initializing MyoWare EMG (GPIO%d)...", MYOWARE_GPIO_PIN);
@@ -359,7 +344,7 @@ void app_main(void) {
     // Core 0: acquisition tasks (SPI + ADC)
     // Core 1: processing + BLE notify + serial output
     xTaskCreatePinnedToCore(imu_upper_task, "imu0_task", 4096, NULL, 5, NULL, 0);
-    xTaskCreatePinnedToCore(imu_lower_task, "imu1_task", 4096, NULL, 5, NULL, 0);
+    // imu_lower_task intentionally NOT launched — single-IMU design.
     xTaskCreatePinnedToCore(emg_task,       "emg_task",  4096, NULL, 5, NULL, 0);
     xTaskCreatePinnedToCore(processing_task,"proc_task", 8192, NULL, 4, NULL, 1);
 
