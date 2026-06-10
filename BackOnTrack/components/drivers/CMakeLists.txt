@@ -1,6 +1,6 @@
 idf_component_register(
     SRCS
-        "driver_bno085.c"
+        "driver_bno085.cpp"
         "driver_myoware.c"
     INCLUDE_DIRS
         "include"
@@ -11,4 +11,5 @@ idf_component_register(
         freertos
         log
         esp_adc
+        esp32_BNO08x
 )
