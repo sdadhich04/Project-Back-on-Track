@@ -762,8 +762,11 @@ static void stage5_live_reads(void)
                 continue;
             }
             if (id == REPORT_GRV) {
-                /* GRV report: need 14 bytes (report_id + 13 data bytes). */
-                if (offset + 14 <= payload_len) {
+                /* GRV report layout from p[offset]:
+                 *   [0]=report_id [1]=seq [2]=status [3]=delay
+                 *   [4..5]=qi  [6..7]=qj  [8..9]=qk  [10..11]=qr
+                 * Need 12 bytes total (through p[offset+11]).          */
+                if (offset + 12 <= payload_len) {
                     uint8_t *p = payload + offset;
                     int16_t qi = (int16_t)((uint16_t)p[4]  | ((uint16_t)p[5]  << 8));
                     int16_t qj = (int16_t)((uint16_t)p[6]  | ((uint16_t)p[7]  << 8));
@@ -774,7 +777,7 @@ static void stage5_live_reads(void)
                              reports, qi, qj, qk, qr);
                     found_grv = true;
                 } else {
-                    ESP_LOGW(TAG, "  [%3d] GRV at payload[%d] but too short (%d bytes left)",
+                    ESP_LOGW(TAG, "  [%3d] GRV at payload[%d] but too short (%d bytes left, need 12)",
                              attempts, offset, payload_len - offset);
                 }
                 break;
