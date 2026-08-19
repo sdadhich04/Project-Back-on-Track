@@ -1,0 +1,12 @@
+idf_component_register(
+    SRCS
+        "main.c"
+        "imu_diag.c"
+    INCLUDE_DIRS
+        "."
+    REQUIRES
+        driver
+        freertos
+        esp_timer
+        log
+)

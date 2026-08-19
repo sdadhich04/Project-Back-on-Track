@@ -1,0 +1,16 @@
+# sdkconfig.defaults for imu_diag
+# Minimal config — no BLE, no ADC, just SPI + GPIO + logging.
+
+# ==================== Target ====================
+CONFIG_IDF_TARGET="esp32s3"
+
+# ==================== FreeRTOS ====================
+CONFIG_FREERTOS_HZ=1000
+
+# ==================== Logging ====================
+# Set to DEBUG so Stage 4 drain loop prints per-packet info.
+# Change to INFO once you have a passing result.
+CONFIG_LOG_DEFAULT_LEVEL_DEBUG=y
+
+# ==================== Compiler ====================
+CONFIG_COMPILER_OPTIMIZATION_NONE=y
