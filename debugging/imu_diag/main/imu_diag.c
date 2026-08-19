@@ -607,56 +607,122 @@ static void stage5_live_reads(void)
     print_sep("STAGE 5: Live GRV reads (10 packets at 50 Hz)");
     ESP_LOGI(TAG, "Enabling Game Rotation Vector report and reading 10 quaternion packets.");
 
-    /* Build SET_FEATURE_COMMAND for GRV at 50 Hz (20 000 µs interval). */
-    uint8_t feat_cmd[17] = {0};
-    feat_cmd[0] = SET_FEAT_CMD;
-    feat_cmd[1] = REPORT_GRV;
-    uint32_t interval_us = 20000;
-    feat_cmd[5] = (uint8_t)( interval_us        & 0xFF);
-    feat_cmd[6] = (uint8_t)((interval_us >>  8) & 0xFF);
-    feat_cmd[7] = (uint8_t)((interval_us >> 16) & 0xFF);
-    feat_cmd[8] = (uint8_t)((interval_us >> 24) & 0xFF);
+    /* ── Step 1: fresh hard reset so the chip is in a known state ────────
+     * Stage 4 left the BNO085 mid-session. Reset it cleanly before
+     * enabling a feature report so there are no stale queued packets.   */
+    ESP_LOGI(TAG, "  Hard reset for clean state...");
+    gpio_set_level(DIAG_PIN_RST, 0);
+    vTaskDelay(pdMS_TO_TICKS(10));
+    gpio_set_level(DIAG_PIN_RST, 1);
 
-    /* Wrap in SHTP header. */
-    uint8_t pkt[17 + SHTP_HDR_LEN];
-    uint16_t total = sizeof(pkt);
-    pkt[0] = (uint8_t)(total & 0xFF);
-    pkt[1] = (uint8_t)((total >> 8) & 0x7F);
-    pkt[2] = SHTP_CH_CTRL;
-    pkt[3] = 0x01;  /* seq */
-    memcpy(pkt + SHTP_HDR_LEN, feat_cmd, 17);
+    if (!wait_int(800)) {
+        ESP_LOGE(TAG, "STAGE 5: FAIL — INT never asserted after hard reset.");
+        return;
+    }
+    ESP_LOGI(TAG, "  INT asserted after reset. Draining boot packets...");
 
-    uint8_t ack[sizeof(pkt)];
-    spi_xfer(pkt, ack, sizeof(pkt));
-    vTaskDelay(pdMS_TO_TICKS(100));
+    /* ── Step 2: drain all boot packets (advertisement + init sequence) ──
+     * Keep reading until INT de-asserts and stays de-asserted for 50 ms.
+     * Log every packet at DEBUG level so we can see what the chip sends. */
+    uint8_t rx[SHTP_MAX_PKT];
+    int drain_count = 0;
+    for (int i = 0; i < 40; i++) {
+        if (!wait_int(50)) break;   /* no more packets pending */
+        int n = read_packet(rx, sizeof(rx), /*heartbeat=*/true);
+        if (n <= 0) break;
+        drain_count++;
+        ESP_LOGD(TAG, "  boot drain [%2d] pkt_n=%d ch=%d payload[0]=0x%02X",
+                 i, n, rx[2],
+                 n > (int)SHTP_HDR_LEN ? rx[SHTP_HDR_LEN] : 0xFF);
+        vTaskDelay(pdMS_TO_TICKS(2));
+    }
+    ESP_LOGI(TAG, "  Drained %d boot packets. Sending SET_FEATURE_COMMAND...", drain_count);
 
-    int reports = 0;
-    for (int attempt = 0; attempt < 100 && reports < 10; attempt++) {
-        wait_int(100);
-        uint8_t rx[SHTP_MAX_PKT];
-        int n = read_packet(rx, sizeof(rx), /*heartbeat=*/false);
-        if (n < (int)(SHTP_HDR_LEN + 14)) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+    /* ── Step 3: send SET_FEATURE_COMMAND for GRV at 50 Hz ───────────────
+     * Full packet = 4-byte SHTP header + 17-byte SET_FEATURES payload.
+     * The SHTP length field encodes the total byte count (21).
+     * Channel = SHTP_CH_CTRL (2), seq = 0x00 (fresh after reset).       */
+    uint8_t feat_pkt[SHTP_HDR_LEN + 17];
+    memset(feat_pkt, 0x00, sizeof(feat_pkt));
+    uint16_t feat_total = sizeof(feat_pkt);          /* 21 */
+    feat_pkt[0] = (uint8_t)(feat_total & 0xFF);
+    feat_pkt[1] = (uint8_t)((feat_total >> 8) & 0x7F);
+    feat_pkt[2] = SHTP_CH_CTRL;
+    feat_pkt[3] = 0x00;                              /* seq */
+    feat_pkt[4] = SET_FEAT_CMD;                      /* 0xFD */
+    feat_pkt[5] = REPORT_GRV;                        /* feature report ID = 0x08 */
+    /* bytes 6..7: reserved (0x00) */
+    /* bytes 8..9: specific config (0x00) */
+    uint32_t interval_us = 20000;                    /* 50 Hz */
+    feat_pkt[9]  = (uint8_t)( interval_us        & 0xFF);
+    feat_pkt[10] = (uint8_t)((interval_us >>  8) & 0xFF);
+    feat_pkt[11] = (uint8_t)((interval_us >> 16) & 0xFF);
+    feat_pkt[12] = (uint8_t)((interval_us >> 24) & 0xFF);
+    /* bytes 13..20: batch interval + sensor-specific config (0x00) */
 
-        if (rx[2] == SHTP_CH_RPTS && rx[SHTP_HDR_LEN] == REPORT_GRV) {
-            reports++;
-            uint8_t *p = rx + SHTP_HDR_LEN;
-            int16_t qi = (int16_t)((uint16_t)p[4]  | ((uint16_t)p[5]  << 8));
-            int16_t qj = (int16_t)((uint16_t)p[6]  | ((uint16_t)p[7]  << 8));
-            int16_t qk = (int16_t)((uint16_t)p[8]  | ((uint16_t)p[9]  << 8));
-            int16_t qr = (int16_t)((uint16_t)p[10] | ((uint16_t)p[11] << 8));
-            ESP_LOGI(TAG, "  GRV[%2d]  qi=%6d  qj=%6d  qk=%6d  qr=%6d",
-                     reports, qi, qj, qk, qr);
+    uint8_t feat_ack[sizeof(feat_pkt)];
+    if (!spi_xfer(feat_pkt, feat_ack, sizeof(feat_pkt))) {
+        ESP_LOGE(TAG, "STAGE 5: FAIL — SPI error sending SET_FEATURE_COMMAND.");
+        return;
+    }
+    ESP_LOGD(TAG, "  SET_FEATURE sent. ack ch=%d payload[0]=0x%02X",
+             feat_ack[2],
+             sizeof(feat_ack) > SHTP_HDR_LEN ? feat_ack[SHTP_HDR_LEN] : 0xFF);
+
+    /* Give the chip time to arm the report before we start polling. */
+    vTaskDelay(pdMS_TO_TICKS(150));
+
+    /* ── Step 4: read 10 GRV reports ─────────────────────────────────────
+     * Log every received packet (channel + report ID) at DEBUG so we can
+     * see exactly what the chip is sending if GRV reports don't appear.  */
+    int reports  = 0;
+    int attempts = 0;
+    for (attempts = 0; attempts < 200 && reports < 10; attempts++) {
+        if (!wait_int(100)) {
+            ESP_LOGD(TAG, "  [%3d] INT timeout", attempts);
+            continue;
         }
-        vTaskDelay(pdMS_TO_TICKS(5));
+        memset(rx, 0, sizeof(rx));
+        int n = read_packet(rx, sizeof(rx), /*heartbeat=*/false);
+        if (n <= 0) {
+            ESP_LOGD(TAG, "  [%3d] empty/invalid packet (n=%d)", attempts, n);
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
+        }
+
+        uint8_t ch      = rx[2];
+        uint8_t rpt_id  = n > (int)SHTP_HDR_LEN ? rx[SHTP_HDR_LEN] : 0x00;
+        uint8_t rpt_seq = n > (int)(SHTP_HDR_LEN + 1) ? rx[SHTP_HDR_LEN + 1] : 0x00;
+
+        if (ch == SHTP_CH_RPTS && rpt_id == REPORT_GRV) {
+            reports++;
+            if (n >= (int)(SHTP_HDR_LEN + 14)) {
+                uint8_t *p = rx + SHTP_HDR_LEN;
+                int16_t qi = (int16_t)((uint16_t)p[4]  | ((uint16_t)p[5]  << 8));
+                int16_t qj = (int16_t)((uint16_t)p[6]  | ((uint16_t)p[7]  << 8));
+                int16_t qk = (int16_t)((uint16_t)p[8]  | ((uint16_t)p[9]  << 8));
+                int16_t qr = (int16_t)((uint16_t)p[10] | ((uint16_t)p[11] << 8));
+                ESP_LOGI(TAG, "  GRV[%2d]  qi=%6d  qj=%6d  qk=%6d  qr=%6d",
+                         reports, qi, qj, qk, qr);
+            } else {
+                ESP_LOGW(TAG, "  GRV[%2d] short packet (n=%d, need %d)",
+                         reports, n, SHTP_HDR_LEN + 14);
+            }
+        } else {
+            /* Not a GRV report — log at DEBUG so we see what IS arriving. */
+            ESP_LOGD(TAG, "  [%3d] ch=%d rpt_id=0x%02X seq=%d n=%d (not GRV)",
+                     attempts, ch, rpt_id, rpt_seq, n);
+        }
+        vTaskDelay(pdMS_TO_TICKS(2));
     }
 
     if (reports >= 10) {
-        ESP_LOGI(TAG, "STAGE 5: PASS — %d GRV reports received.", reports);
+        ESP_LOGI(TAG, "STAGE 5: PASS — %d GRV reports in %d attempts.", reports, attempts);
         ESP_LOGI(TAG, "  IMU0 is fully operational.");
     } else {
-        ESP_LOGW(TAG, "STAGE 5: PARTIAL — only %d/10 GRV reports received.", reports);
-        ESP_LOGW(TAG, "  Hardware is working (earlier stages passed). Likely a timing issue.");
-        ESP_LOGW(TAG, "  Try increasing the wait_int() timeout or adding more drain iterations.");
+        ESP_LOGW(TAG, "STAGE 5: PARTIAL — %d/10 GRV reports in %d attempts.", reports, attempts);
+        ESP_LOGW(TAG, "  Hardware passed Stages 1-4. Check DEBUG log above for what");
+        ESP_LOGW(TAG, "  channel/report IDs the chip is actually sending.");
     }
 }
 
