@@ -712,8 +712,12 @@ static void stage5_live_reads(void)
     }
 
     /* ── Step 4: read 10 GRV reports ─────────────────────────────────────
-     * Log every received packet (channel + report ID) at DEBUG so we can
-     * see exactly what the chip is sending if GRV reports don't appear.  */
+     * IMPORTANT: The BNO085 packs a Base Timestamp Reference (0xFB, 5 bytes)
+     * immediately before sensor reports in the same SHTP packet on ch=3.
+     * Packet layout on ch=3:
+     *   [SHTP header 4B][0xFB timestamp 5B][report_id 0x08][report data 13B]
+     * So rx[SHTP_HDR_LEN] == 0xFB, and GRV starts at rx[SHTP_HDR_LEN + 5].
+     * We must scan the payload rather than only checking byte 0.           */
     int reports  = 0;
     int attempts = 0;
     for (attempts = 0; attempts < 200 && reports < 10; attempts++) {
@@ -729,28 +733,61 @@ static void stage5_live_reads(void)
             continue;
         }
 
-        uint8_t ch      = rx[2];
-        uint8_t rpt_id  = n > (int)SHTP_HDR_LEN ? rx[SHTP_HDR_LEN] : 0x00;
-        uint8_t rpt_seq = n > (int)(SHTP_HDR_LEN + 1) ? rx[SHTP_HDR_LEN + 1] : 0x00;
+        uint8_t ch     = rx[2];
+        uint8_t rpt_id = n > (int)SHTP_HDR_LEN ? rx[SHTP_HDR_LEN] : 0x00;
 
-        if (ch == SHTP_CH_RPTS && rpt_id == REPORT_GRV) {
-            reports++;
-            if (n >= (int)(SHTP_HDR_LEN + 14)) {
-                uint8_t *p = rx + SHTP_HDR_LEN;
-                int16_t qi = (int16_t)((uint16_t)p[4]  | ((uint16_t)p[5]  << 8));
-                int16_t qj = (int16_t)((uint16_t)p[6]  | ((uint16_t)p[7]  << 8));
-                int16_t qk = (int16_t)((uint16_t)p[8]  | ((uint16_t)p[9]  << 8));
-                int16_t qr = (int16_t)((uint16_t)p[10] | ((uint16_t)p[11] << 8));
-                ESP_LOGI(TAG, "  GRV[%2d]  qi=%6d  qj=%6d  qk=%6d  qr=%6d",
-                         reports, qi, qj, qk, qr);
-            } else {
-                ESP_LOGW(TAG, "  GRV[%2d] short packet (n=%d, need %d)",
-                         reports, n, SHTP_HDR_LEN + 14);
+        if (ch != SHTP_CH_RPTS) {
+            ESP_LOGD(TAG, "  [%3d] ch=%d rpt_id=0x%02X n=%d (not sensor ch)",
+                     attempts, ch, rpt_id, n);
+            vTaskDelay(pdMS_TO_TICKS(2));
+            continue;
+        }
+
+        /* Scan the payload for the GRV report ID (0x08).
+         * 0xFB (Base Timestamp Ref) is 5 bytes; skip it if present.
+         * 0xFA (Timestamp Rebase) is also 5 bytes; skip similarly.
+         * Any other non-GRV report ID: log and continue.                 */
+        uint8_t *payload     = rx + SHTP_HDR_LEN;
+        int      payload_len = n  - SHTP_HDR_LEN;
+        int      offset      = 0;
+        bool     found_grv   = false;
+
+        while (offset < payload_len) {
+            uint8_t id = payload[offset];
+            if (id == 0xFB || id == 0xFA) {
+                /* Timestamp record: 5 bytes total, skip. */
+                ESP_LOGD(TAG, "  [%3d] timestamp 0x%02X at payload[%d], skipping 5B",
+                         attempts, id, offset);
+                offset += 5;
+                continue;
             }
-        } else {
-            /* Not a GRV report — log at DEBUG so we see what IS arriving. */
-            ESP_LOGD(TAG, "  [%3d] ch=%d rpt_id=0x%02X seq=%d n=%d (not GRV)",
-                     attempts, ch, rpt_id, rpt_seq, n);
+            if (id == REPORT_GRV) {
+                /* GRV report: need 14 bytes (report_id + 13 data bytes). */
+                if (offset + 14 <= payload_len) {
+                    uint8_t *p = payload + offset;
+                    int16_t qi = (int16_t)((uint16_t)p[4]  | ((uint16_t)p[5]  << 8));
+                    int16_t qj = (int16_t)((uint16_t)p[6]  | ((uint16_t)p[7]  << 8));
+                    int16_t qk = (int16_t)((uint16_t)p[8]  | ((uint16_t)p[9]  << 8));
+                    int16_t qr = (int16_t)((uint16_t)p[10] | ((uint16_t)p[11] << 8));
+                    reports++;
+                    ESP_LOGI(TAG, "  GRV[%2d]  qi=%6d  qj=%6d  qk=%6d  qr=%6d",
+                             reports, qi, qj, qk, qr);
+                    found_grv = true;
+                } else {
+                    ESP_LOGW(TAG, "  [%3d] GRV at payload[%d] but too short (%d bytes left)",
+                             attempts, offset, payload_len - offset);
+                }
+                break;
+            }
+            /* Unknown report ID — log and bail out of inner scan. */
+            ESP_LOGD(TAG, "  [%3d] unknown rpt_id=0x%02X at payload[%d], n=%d",
+                     attempts, id, offset, n);
+            break;
+        }
+
+        if (!found_grv && ch == SHTP_CH_RPTS) {
+            ESP_LOGD(TAG, "  [%3d] ch=3 packet had no GRV (first_id=0x%02X n=%d)",
+                     attempts, rpt_id, n);
         }
         vTaskDelay(pdMS_TO_TICKS(2));
     }
