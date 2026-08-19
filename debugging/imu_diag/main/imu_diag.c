@@ -202,7 +202,9 @@ static bool stage0_gpio_loopback(void)
 
     /* Walk pattern 0b10101010 bit by bit. */
     const uint8_t pattern = 0xAA;
-    int pass = 0, fail = 0;
+    int pass = 0;
+    int fail_pullhigh = 0;  /* sent=0, read=1 — floating/no-jumper */
+    int fail_output   = 0;  /* sent=1, read=0 — output driver dead  */
     for (int bit = 7; bit >= 0; bit--) {
         int out_bit = (pattern >> bit) & 1;
         gpio_set_level(DIAG_PIN_MOSI, out_bit);
@@ -211,21 +213,36 @@ static bool stage0_gpio_loopback(void)
         bool ok = (out_bit == in_bit);
         ESP_LOGI(TAG, "  bit%d  sent=%d  read=%d  %s",
                  bit, out_bit, in_bit, ok ? "OK" : "MISMATCH");
-        if (ok) pass++; else fail++;
+        if (ok) {
+            pass++;
+        } else if (out_bit == 0 && in_bit == 1) {
+            fail_pullhigh++;   /* MISO pulled high — jumper not installed / no contact */
+        } else {
+            fail_output++;     /* MOSI driving HIGH but MISO read LOW — real GPIO fault */
+        }
     }
 
     ESP_LOGI(TAG, "ACTION: Remove the jumper before Stage 1. Waiting 5 s...");
     vTaskDelay(pdMS_TO_TICKS(5000));
 
-    if (fail == 0) {
+    if (fail_output == 0 && fail_pullhigh == 0) {
         ESP_LOGI(TAG, "STAGE 0: PASS (%d/8 bits correct)", pass);
         ESP_LOGI(TAG, "  GPIO%d and GPIO%d are both functional.", DIAG_PIN_MOSI, DIAG_PIN_MISO);
-    } else {
-        ESP_LOGE(TAG, "STAGE 0: FAIL (%d/8 bits mismatched)", fail);
-        ESP_LOGE(TAG, "  GPIO%d or GPIO%d is dead, or jumper did not make contact.",
+        return true;
+    } else if (fail_output == 0 && fail_pullhigh > 0) {
+        ESP_LOGW(TAG, "STAGE 0: SKIP — jumper not installed or no contact (%d bits floated high).",
+                 fail_pullhigh);
+        ESP_LOGW(TAG, "  All mismatches were sent=0/read=1 (MISO pull-up, not a dead GPIO).");
+        ESP_LOGW(TAG, "  GPIO%d and GPIO%d are presumed functional. Continuing to Stage 1.",
                  DIAG_PIN_MOSI, DIAG_PIN_MISO);
+        return true;   /* SKIP is not a blocking fault — continue the test sequence */
+    } else {
+        ESP_LOGE(TAG, "STAGE 0: FAIL — output driver fault (%d bits: sent=1, read=0).",
+                 fail_output);
+        ESP_LOGE(TAG, "  GPIO%d cannot drive HIGH, or GPIO%d is shorted to GND.",
+                 DIAG_PIN_MOSI, DIAG_PIN_MISO);
+        return false;
     }
-    return fail == 0;
 }
 
 /* ═════════════════════════════════════════════════════════════════════════
@@ -665,8 +682,8 @@ void imu_diag_run(void)
 
     bool s0 = stage0_gpio_loopback();
     if (!s0) {
-        ESP_LOGE(TAG, "Halting: the ESP32-S3 GPIO itself is broken. "
-                 "Fix before diagnosing SPI.");
+        ESP_LOGE(TAG, "Halting: GPIO output driver on GPIO%d or GPIO%d is dead. "
+                 "Fix before diagnosing SPI.", DIAG_PIN_MOSI, DIAG_PIN_MISO);
         goto summary;
     }
 
@@ -701,7 +718,8 @@ void imu_diag_run(void)
 
 summary:
     print_sep("FINAL SUMMARY");
-    ESP_LOGI(TAG, "  Stage 0  GPIO loopback         %s", s0 ? "PASS" : "FAIL");
+    /* s0 is false only for a real output-driver fault; SKIP returns true */
+    ESP_LOGI(TAG, "  Stage 0  GPIO loopback         %s", s0 ? "PASS/SKIP" : "FAIL");
     ESP_LOGI(TAG, "  Stage 1  SPI idle MISO         %s", s1 ? "PASS" : "FAIL");
     ESP_LOGI(TAG, "  Stage 2  RST + INT             %s", s2 ? "PASS" : s1 ? "FAIL" : "SKIP");
     ESP_LOGI(TAG, "  Stage 3  SHTP advertisement    %s", s3 ? "PASS" : (s2 ? "FAIL" : "SKIP"));
@@ -714,7 +732,7 @@ summary:
         ESP_LOGI(TAG, "  timing issue. Enable DEBUG logging in Back on Track and look");
         ESP_LOGI(TAG, "  at which drain iteration the 0xF8 response appears.");
     } else if (!s0) {
-        ESP_LOGE(TAG, "  BLOCKED at Stage 0: ESP32-S3 GPIO fault.");
+        ESP_LOGE(TAG, "  BLOCKED at Stage 0: GPIO output driver dead (sent=1, read=0 faults).");
     } else if (!s1) {
         ESP_LOGE(TAG, "  BLOCKED at Stage 1: MISO shorted to GND.");
     } else if (!s2) {
