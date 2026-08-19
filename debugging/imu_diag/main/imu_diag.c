@@ -621,56 +621,95 @@ static void stage5_live_reads(void)
     }
     ESP_LOGI(TAG, "  INT asserted after reset. Draining boot packets...");
 
-    /* ── Step 2: drain all boot packets (advertisement + init sequence) ──
-     * Keep reading until INT de-asserts and stays de-asserted for 50 ms.
-     * Log every packet at DEBUG level so we can see what the chip sends. */
+    /* ── Step 2: drain ALL boot packets — no iteration cap ───────────────
+     * The BNO085 sends its capability advertisement in many fragments on
+     * ch=0 after reset. We must read until INT de-asserts naturally before
+     * sending any command — otherwise our TX bytes are ignored because the
+     * chip is still in its boot-sequence transmit state.
+     * Stop condition: wait_int(50) returns false = INT stayed HIGH for
+     * 50 ms = chip has nothing more to send.                             */
     uint8_t rx[SHTP_MAX_PKT];
     int drain_count = 0;
-    for (int i = 0; i < 40; i++) {
-        if (!wait_int(50)) break;   /* no more packets pending */
-        int n = read_packet(rx, sizeof(rx), /*heartbeat=*/true);
+    for (int i = 0; i < 200; i++) {
+        if (!wait_int(50)) {
+            ESP_LOGD(TAG, "  boot drain done — INT idle after %d packets.", drain_count);
+            break;
+        }
+        int n = read_packet(rx, sizeof(rx), /*heartbeat=*/false);
         if (n <= 0) break;
         drain_count++;
-        ESP_LOGD(TAG, "  boot drain [%2d] pkt_n=%d ch=%d payload[0]=0x%02X",
+        ESP_LOGD(TAG, "  boot drain [%3d] pkt_n=%d ch=%d payload[0]=0x%02X",
                  i, n, rx[2],
                  n > (int)SHTP_HDR_LEN ? rx[SHTP_HDR_LEN] : 0xFF);
-        vTaskDelay(pdMS_TO_TICKS(2));
     }
-    ESP_LOGI(TAG, "  Drained %d boot packets. Sending SET_FEATURE_COMMAND...", drain_count);
+    ESP_LOGI(TAG, "  Drained %d boot packets. INT is now idle.", drain_count);
+    /* Extra guard: wait 20 ms after last INT de-assertion before sending. */
+    vTaskDelay(pdMS_TO_TICKS(20));
 
     /* ── Step 3: send SET_FEATURE_COMMAND for GRV at 50 Hz ───────────────
-     * Full packet = 4-byte SHTP header + 17-byte SET_FEATURES payload.
-     * The SHTP length field encodes the total byte count (21).
-     * Channel = SHTP_CH_CTRL (2), seq = 0x00 (fresh after reset).       */
+     * Full packet = 4-byte SHTP header + 17-byte SET_FEATURES payload = 21 bytes.
+     * Sent as a standalone CS transaction (no pending chip data — we just
+     * drained everything, so the chip will actually read our MOSI bytes).
+     *
+     * SET_FEATURES_COMMAND layout (BNO085 datasheet §6.5.4):
+     *   byte 0 (payload[0]): report ID = 0xFD
+     *   byte 1 (payload[1]): feature report ID = 0x08 (GRV)
+     *   byte 2 (payload[2]): flags (0)
+     *   byte 3 (payload[3]): change sensitivity LSB (0)
+     *   byte 4 (payload[4]): change sensitivity MSB (0)
+     *   bytes 5–8           : report interval µs (little-endian)
+     *   bytes 9–12          : batch interval µs (0 = disabled)
+     *   bytes 13–16         : sensor-specific config (0)                */
     uint8_t feat_pkt[SHTP_HDR_LEN + 17];
     memset(feat_pkt, 0x00, sizeof(feat_pkt));
-    uint16_t feat_total = sizeof(feat_pkt);          /* 21 */
-    feat_pkt[0] = (uint8_t)(feat_total & 0xFF);
-    feat_pkt[1] = (uint8_t)((feat_total >> 8) & 0x7F);
+    feat_pkt[0] = (uint8_t)(sizeof(feat_pkt) & 0xFF);   /* length LSB = 21 */
+    feat_pkt[1] = (uint8_t)((sizeof(feat_pkt) >> 8) & 0x7F);
     feat_pkt[2] = SHTP_CH_CTRL;
-    feat_pkt[3] = 0x00;                              /* seq */
-    feat_pkt[4] = SET_FEAT_CMD;                      /* 0xFD */
-    feat_pkt[5] = REPORT_GRV;                        /* feature report ID = 0x08 */
-    /* bytes 6..7: reserved (0x00) */
-    /* bytes 8..9: specific config (0x00) */
-    uint32_t interval_us = 20000;                    /* 50 Hz */
+    feat_pkt[3] = 0x00;                                  /* seq */
+    feat_pkt[4] = SET_FEAT_CMD;                          /* 0xFD */
+    feat_pkt[5] = REPORT_GRV;                            /* 0x08 */
+    uint32_t interval_us = 20000;                        /* 50 Hz */
     feat_pkt[9]  = (uint8_t)( interval_us        & 0xFF);
     feat_pkt[10] = (uint8_t)((interval_us >>  8) & 0xFF);
     feat_pkt[11] = (uint8_t)((interval_us >> 16) & 0xFF);
     feat_pkt[12] = (uint8_t)((interval_us >> 24) & 0xFF);
-    /* bytes 13..20: batch interval + sensor-specific config (0x00) */
 
     uint8_t feat_ack[sizeof(feat_pkt)];
     if (!spi_xfer(feat_pkt, feat_ack, sizeof(feat_pkt))) {
         ESP_LOGE(TAG, "STAGE 5: FAIL — SPI error sending SET_FEATURE_COMMAND.");
         return;
     }
-    ESP_LOGD(TAG, "  SET_FEATURE sent. ack ch=%d payload[0]=0x%02X",
-             feat_ack[2],
-             sizeof(feat_ack) > SHTP_HDR_LEN ? feat_ack[SHTP_HDR_LEN] : 0xFF);
+    ESP_LOGI(TAG, "  SET_FEATURE_COMMAND sent (GRV @ 50 Hz).");
 
-    /* Give the chip time to arm the report before we start polling. */
-    vTaskDelay(pdMS_TO_TICKS(150));
+    /* ── Step 3b: wait for Get Feature Response (0xFC on ch=2) ───────────
+     * The BNO085 responds to SET_FEATURE with a 0xFC Get Feature Response
+     * on SHTP_CH_CTRL confirming the feature was armed. If we see 0xFC
+     * we know the chip received and processed our command.
+     * Also accept seeing sensor data (ch=3) as implicit confirmation.    */
+    bool feat_confirmed = false;
+    ESP_LOGI(TAG, "  Waiting for Get Feature Response (0xFC on ch=2)...");
+    for (int i = 0; i < 30; i++) {
+        if (!wait_int(100)) { vTaskDelay(pdMS_TO_TICKS(5)); continue; }
+        memset(rx, 0, sizeof(rx));
+        int n = read_packet(rx, sizeof(rx), /*heartbeat=*/false);
+        if (n <= 0) continue;
+        uint8_t ch     = rx[2];
+        uint8_t rpt_id = n > (int)SHTP_HDR_LEN ? rx[SHTP_HDR_LEN] : 0x00;
+        ESP_LOGD(TAG, "  feat confirm [%2d] ch=%d rpt_id=0x%02X n=%d", i, ch, rpt_id, n);
+        if (ch == SHTP_CH_CTRL && rpt_id == 0xFC) {
+            ESP_LOGI(TAG, "  Get Feature Response (0xFC) received — GRV armed.");
+            feat_confirmed = true;
+            break;
+        }
+        if (ch == SHTP_CH_RPTS) {
+            ESP_LOGI(TAG, "  Sensor data arrived on ch=3 — feature active.");
+            feat_confirmed = true;
+            break;
+        }
+    }
+    if (!feat_confirmed) {
+        ESP_LOGW(TAG, "  No 0xFC confirmation — chip may still arm the feature. Continuing.");
+    }
 
     /* ── Step 4: read 10 GRV reports ─────────────────────────────────────
      * Log every received packet (channel + report ID) at DEBUG so we can
